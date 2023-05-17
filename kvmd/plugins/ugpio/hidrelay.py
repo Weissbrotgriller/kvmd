@@ -3,6 +3,7 @@
 #    KVMD - The main PiKVM daemon.                                           #
 #                                                                            #
 #    Copyright (C) 2018-2022  Maxim Devaev <mdevaev@gmail.com>               #
+#                  2023  Christian Stock                                     #
 #                                                                            #
 #    This program is free software: you can redistribute it and/or modify    #
 #    it under the terms of the GNU General Public License as published by    #
@@ -39,6 +40,7 @@ from ...yamlconf import Option
 from ...validators.basic import valid_number
 from ...validators.basic import valid_float_f01
 from ...validators.os import valid_abs_path
+from ...validators.basic import valid_bool
 
 from . import GpioDriverOfflineError
 from . import UserGpioModes
@@ -49,6 +51,7 @@ from . import BaseUserGpioDriver
 class Plugin(BaseUserGpioDriver):
     # http://vusb.wikidot.com/project:driver-less-usb-relays-hid-interface
     # https://github.com/trezor/cython-hidapi/blob/6057d41b5a2552a70ff7117a9d19fc21bf863867/chid.pxd
+    # https://github.com/zwizwa/usb_relay_ch551g
 
     def __init__(  # pylint: disable=super-init-not-called
         self,
@@ -57,6 +60,7 @@ class Plugin(BaseUserGpioDriver):
 
         device_path: str,
         state_poll: float,
+        ch551g: bool,
     ) -> None:
 
         super().__init__(instance_name, notifier)
@@ -68,12 +72,15 @@ class Plugin(BaseUserGpioDriver):
         self.__stop = False
 
         self.__initials: dict[int, (bool | None)] = {}
+        self.__pin_state = 0
+        self.__ch551g = ch551g
 
     @classmethod
     def get_plugin_options(cls) -> dict:
         return {
             "device":     Option("",  type=valid_abs_path, unpack_as="device_path"),
             "state_poll": Option(5.0, type=valid_float_f01),
+            "ch551g": Option(0, type=valid_bool),
         }
 
     @classmethod
@@ -147,15 +154,27 @@ class Plugin(BaseUserGpioDriver):
 
     def __inner_read_raw(self) -> int:
         with self.__ensure_device("reading") as device:
-            return device.get_feature_report(1, 8)[7]
+            if self.__ch551g:
+                return self.__pin_state
+            else:
+                return device.get_feature_report(1, 8)[7]
 
     def __inner_write(self, pin: int, state: bool) -> None:
         assert 0 <= pin <= 7
-        with self.__ensure_device("writing") as device:
-            report = [(0xFF if state else 0xFD), pin + 1]  # Pin numeration starts from 0
-            result = device.send_feature_report(report)
-            if result < 0:
-                raise RuntimeError(f"Retval of send_feature_report() < 0: {result}")
+        if self.__ch551g:
+            with self.__ensure_device("writing") as device:
+                report = [0x00, ( (0xF0 if state else 0x00) | (pin+1) )]  # Pin numeration starts from 0
+                result = device.write(report)
+                if result < 0:
+                    raise RuntimeError(f"Retval of write() < 0: {result}")
+                else:
+                    self.__pin_state = (self.__pin_state & ~(1 << pin)) | (state << pin)
+        else:
+            with self.__ensure_device("writing") as device:
+                report = [(0xFF if state else 0xFD), pin + 1]  # Pin numeration starts from 0
+                result = device.send_feature_report(report)
+                if result < 0:
+                    raise RuntimeError(f"Retval of send_feature_report() < 0: {result}")
 
     @contextlib.contextmanager
     def __ensure_device(self, context: str) -> hid.device:  # type: ignore
@@ -167,11 +186,15 @@ class Plugin(BaseUserGpioDriver):
             self.__device = device
             get_logger(0).info("Opened %s on %s while %s", self, self.__device_path, context)
         try:
+            if self.__ch551g:
+                open(self.__device_path, 'r')
             yield self.__device
         except Exception as err:
             get_logger(0).error("Error occured on %s on %s while %s: %s",
                                 self, self.__device_path, context, tools.efmt(err))
             self.__close_device()
+            if self.ch551g:
+                self.__pin_state = 0
             raise
 
     def __close_device(self) -> None:
